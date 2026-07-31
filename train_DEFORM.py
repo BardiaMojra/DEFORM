@@ -120,7 +120,7 @@ def save_pickle(data, myfile):
     with open(myfile, "wb") as f:
         pickle.dump(data, f)
 
-def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_time_horizon, batch, DEFORM_func, DEFORM_sim, device):
+def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_time_horizon, batch, DEFORM_func, DEFORM_sim, device, max_update_steps=None):
     '''
     Dataset Loading
     '''
@@ -323,7 +323,34 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
         DEFORM_sim.DEFORM_func.twist_stiffness = nn.Parameter(5e-5 * torch.ones((1, n_edge), device=device))
 
     else:
-        raise ValueError("No matching DLO type")
+        # Data-driven fallback for any DLO_type not in the hardcoded list above: read
+        # n_vert/rest_vert/initial stiffness from data_set/<DLO_type>/dlo_type_config.json
+        # (written by ~/git/dynamic_dlo_evaluation/dev/prep_deform_dataset.py) instead of
+        # requiring a new hand-written elif per trajectory tag. See deform_notes.md
+        # (~/ros_ws/docs_n_papers/) for the fuller design rationale.
+        import json
+        cfg_path = os.path.join("data_set", DLO_type, "dlo_type_config.json")
+        if not os.path.isfile(cfg_path):
+            raise ValueError("No matching DLO type, and no data-driven config at %s" % cfg_path)
+        with open(cfg_path, "r") as f:
+            dlo_cfg = json.load(f)
+        n_vert = dlo_cfg["n_vert"]
+        n_edge = n_vert - 1
+        device = device
+        DEFORM_func = DEFORM_func(n_vert=n_vert, n_edge=n_vert - 1, device=device)
+        DEFORM_sim = DEFORM_sim(n_vert=n_vert, n_edge=n_vert - 1, pbd_iter=10, device=device)
+
+        # rest_vert here is already in this project's own robot/arm frame (straight from
+        # dlo_perception's own dlo_dyn_xyz, frame 0 of the first episode processed) -- no
+        # axis remap needed, unlike the DLO1-5 blocks above which remap from the authors'
+        # own mocap capture frame.
+        rest_vert = torch.tensor(dlo_cfg["rest_vert"], device=device).unsqueeze(dim=0)
+        DEFORM_sim.m_restEdgeL, DEFORM_sim.m_restRegionL = computeLengths(computeEdges(rest_vert.clone()))
+        DEFORM_sim.rest_vert = nn.Parameter(rest_vert)
+        DEFORM_sim.DEFORM_func.bend_stiffness = nn.Parameter(
+            dlo_cfg["bend_stiffness_init"] * torch.ones((1, n_edge), device=device))
+        DEFORM_sim.DEFORM_func.twist_stiffness = nn.Parameter(
+            dlo_cfg["twist_stiffness_init"] * torch.ones((1, n_edge), device=device))
 
     """clamped start edge and end edge"""
     clamped_index = torch.zeros(n_vert)
@@ -461,7 +488,8 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
 
                             eval_time += 1
                 eval_losses.append(eval_loss.cpu().detach().numpy() / (eval_time_horizon * part_eval // eval_batch))
-                print(eval_losses)
+                print("[eval] step=%d eval_loss=%.6f  (history: %s)"
+                      % (update_steps, eval_losses[-1], eval_losses), flush=True)
                 eval_epochs.append(update_steps)
                 """save loss into local files. to do: tensor board"""
                 save_pickle(eval_losses, "loss_record/eval_loss_%s.pkl" % (DLO_type))
@@ -491,9 +519,14 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
 
                 losses.append(traj_loss.cpu().detach().numpy() / train_time_horizon)
                 epochs.append(update_steps)
+                print("[train] step=%d epoch=%d loss=%.6f" % (update_steps, epoch, losses[-1]), flush=True)
                 if save_steps % save_period == 0:
                     save_pickle(losses, "loss_record/train_loss_%s.pkl" %DLO_type)
                     save_pickle(epochs, "loss_record/train_epoch_%s.pkl" %DLO_type)
+                if max_update_steps is not None and update_steps >= max_update_steps:
+                    torch.save(DEFORM_sim.state_dict(), os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))))
+                    print("[train] reached max_update_steps=%d, stopping" % max_update_steps, flush=True)
+                    return
 
             if train_time_horizon > 1:
                 previous_vertices, vertices, target_vertices, m_u0 = data
@@ -526,9 +559,14 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                     update_steps += 1
                     losses.append(traj_loss.cpu().detach().numpy() / train_time_horizon)
                     epochs.append(update_steps)
+                    print("[train] step=%d epoch=%d loss=%.6f" % (update_steps, epoch, losses[-1]), flush=True)
                     if save_steps % save_period == 0:
                         save_pickle(losses, "loss_record/train_loss_%s.pkl" % DLO_type)
                         save_pickle(epochs, "loss_record/train_epoch_%s.pkl" % DLO_type)
+                    if max_update_steps is not None and update_steps >= max_update_steps:
+                        torch.save(DEFORM_sim.state_dict(), os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))))
+                        print("[train] reached max_update_steps=%d, stopping" % max_update_steps, flush=True)
+                        return
 
                 else:
                     inputs = target_vertices[:, :, clamped_selection]
@@ -577,9 +615,14 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                     update_steps += 1
                     losses.append(traj_loss_record.cpu().detach().numpy() / train_time_horizon)
                     epochs.append(update_steps)
+                    print("[train] step=%d epoch=%d loss=%.6f" % (update_steps, epoch, losses[-1]), flush=True)
                     if save_steps % save_period == 0:
                         save_pickle(losses, "loss_record/train_loss_%s.pkl" % DLO_type)
                         save_pickle(epochs, "loss_record/train_epoch_%s.pkl" % DLO_type)
+                    if max_update_steps is not None and update_steps >= max_update_steps:
+                        torch.save(DEFORM_sim.state_dict(), os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))))
+                        print("[train] reached max_update_steps=%d, stopping" % max_update_steps, flush=True)
+                        return
 
 if __name__ == "__main__":
     '''
@@ -597,6 +640,24 @@ if __name__ == "__main__":
     parser.add_argument("--eval_set_number", type=int, default=14)
     parser.add_argument("--train_time_horizon", type=int, default=100)
     parser.add_argument("--eval_time_horizon", type=int, default=500)
+    # upstream hardcoded device="cpu" below regardless of CUDA availability, despite
+    # this docstring saying "cuda:0/CPU switchable" -- confirmed via nvidia-smi showing
+    # zero GPU utilization during a real training run (~15-17s/step on CPU). Default to
+    # CUDA when available; override with --device cpu if ever needed.
+    parser.add_argument("--device", type=str,
+                         default="cuda:0" if torch.cuda.is_available() else "cpu")
+    # additive: upstream's train() loops train_epoch=100 * len(train_data_loader) steps
+    # with no way to stop early or bound wall-clock time; None preserves original
+    # (unbounded) behavior.
+    parser.add_argument("--max_update_steps", type=int, default=None,
+                         help="stop after this many training steps (checkpoints/eval "
+                              "already happen every 20 steps regardless) [unbounded]")
     args = parser.parse_args()
-    train(DLO_type=args.DLO_type, train_set_number=56, eval_set_number=14, train_time_horizon=100, eval_time_horizon=500, batch=32, DEFORM_func=DEFORM_func, DEFORM_sim=DEFORM_sim, device="cpu")
+    # NOTE: upstream previously ignored args.train_set_number/eval_set_number/
+    # train_time_horizon/eval_time_horizon here, hardcoding 56/14/100/500 regardless of
+    # what was passed on the CLI -- now actually wired through.
+    train(DLO_type=args.DLO_type, train_set_number=args.train_set_number,
+          eval_set_number=args.eval_set_number, train_time_horizon=args.train_time_horizon,
+          eval_time_horizon=args.eval_time_horizon, batch=32, DEFORM_func=DEFORM_func,
+          DEFORM_sim=DEFORM_sim, device=args.device, max_update_steps=args.max_update_steps)
 
