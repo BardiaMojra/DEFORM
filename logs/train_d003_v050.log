@@ -1,6 +1,6 @@
-[2026-08-04 10:47:38] === starting DEFORM training: DLO_type=d003_v054 train_time_horizon=20 eval_time_horizon=100 max_update_steps=200 ===
+[2026-08-04 10:47:38] === starting DEFORM training: DLO_type=d003_v050 train_time_horizon=20 eval_time_horizon=100 max_update_steps=200 ===
 [2026-08-04 10:47:38] GPU: NVIDIA GeForce RTX 2060 (cuda:0)
-[2026-08-04 10:47:38] logging to logs/train_d003_v054.log
+[2026-08-04 10:47:38] logging to logs/train_d003_v050.log
 [2026-08-04 10:47:39] [data] precomputing mu_0 (bishop frames) for 56 train episodes, 8069056 frames total, on CPU
 [2026-08-04 10:47:40] [data] [░░░░░░░░░░░░░░░░░░░░]   0.0% frames 2000/8069056 ep 1/56  1843 frames/s  ETA 4376s
 [2026-08-04 10:47:41] [data] [░░░░░░░░░░░░░░░░░░░░]   0.0% frames 4000/8069056 ep 1/56  1875 frames/s  ETA 4302s
