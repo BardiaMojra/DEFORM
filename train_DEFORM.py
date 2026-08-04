@@ -1,6 +1,10 @@
 import glob
 import os
 import argparse
+import re
+import shutil
+import sys
+import time
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -19,8 +23,125 @@ import torch.nn as nn
 random.seed(0)
 torch.manual_seed(0)
 "initial release of DEFORM"
+
+# ── ANSI colours -- same palette/names as dynamic_dlo_evaluation's batch_eval_dynamic.py,
+# kept consistent across the whole harness ──────────────────────────────────────────────
+RST = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GRN = "\033[32m"
+YLW = "\033[33m"
+CYN = "\033[36m"
+BRED = "\033[91m"
+BGRN = "\033[92m"
+BYLW = "\033[93m"
+BCYN = "\033[96m"
+BAR_FULL, BAR_EMPTY = "█", "░"
+_TTY = os.isatty(1)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def c(text, *codes):
+    """No-op (returns plain text) when stdout isn't a real terminal, so redirected/piped
+    output and the log file below never end up with raw escape codes in them."""
+    if not codes or not _TTY:
+        return str(text)
+    return "".join(codes) + str(text) + RST
+
+
+def term_cols(default=80):
+    """Current terminal width, re-queried on every call (not cached) so bars stay correctly
+    sized across a resize instead of freezing at whatever the width was when training
+    started. Falls back to `default` when stdout isn't a real terminal (e.g. redirected to
+    a file/pipe/nohup)."""
+    return shutil.get_terminal_size((default, 24)).columns
+
+
+def pbar(pct, width=None, color=BGRN):
+    if width is None:
+        # scale the bar itself to the terminal instead of a fixed 20 chars, so it can't
+        # overflow (and wrap, breaking in-place redraw) in a narrow window
+        width = max(10, min(30, term_cols() // 4))
+    pct = max(0, min(100, pct))
+    filled = int(width * pct / 100)
+    inner = c(BAR_FULL * filled, color) + c(BAR_EMPTY * (width - filled), DIM)
+    return "[" + inner + "] " + c("%5.1f%%" % pct, BOLD)
+
+
+def _default_log(msg, color=None, in_place=False):
+    """Fallback log_fn for Train_DeformData/Eval_DeformData when used outside train()'s own
+    colorized+file-backed logger (e.g. imported standalone) -- same (msg, color, in_place)
+    signature, just prints plainly (in_place is a no-op here -- no log file to keep in sync
+    with, so there's nothing gained by overwriting)."""
+    print(msg, flush=True)
+
+
+def make_logger(dlo_type):
+    """Additive (not upstream): mirror every print() to logs/train_<DLO_type>.log so
+    progress survives a detached/backgrounded run instead of only going to whatever
+    terminal happens to be attached -- see deform_notes.md "slow/looks-frozen training"
+    writeup. Line-buffered (buffering=1) so a periodic `tail` sees fresh lines without
+    waiting on process exit. The log file always gets the plain (un-colored) line -- only
+    the terminal copy is colorized -- so grep/tail -f stay readable either way."""
+    os.makedirs("logs", exist_ok=True)
+    log_path = os.path.join("logs", "train_%s.log" % dlo_type)
+    log_file = open(log_path, "a", buffering=1)
+
+    def log(msg, color=None):
+        # msg may already contain inline c(...) color tags (e.g. a colored "[data]" prefix
+        # mixed with plain text) -- strip ANSI codes for the file line regardless, so the
+        # log file is always plain/grep-able no matter how the caller built the string.
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        term_msg = c(msg, color) if color else msg
+        plain_line = "[%s] %s" % (ts, _ANSI_RE.sub("", msg))
+        print("%s %s" % (c("[%s]" % ts, DIM), term_msg), flush=True)
+        log_file.write(plain_line + "\n")
+    return log, log_path
+
+
+def find_latest_checkpoint(dlo_type, save_model_dir="save_model"):
+    """Mirrors dynamic_dlo_evaluation/dev/deform_adapter.py's own find_latest_checkpoint()
+    (same glob + numeric-step-suffix-parse logic -- filenames are "<tag>_<step>.pth", and
+    sorting them as plain strings orders "100" before "80") -- reimplemented locally rather
+    than imported cross-repo, since this runs inside DEFORM's own pinned venv (torch/
+    theseus) and that module pulls in a different script's own dependency chain. Returns
+    (path, step) or (None, None)."""
+    candidates = glob.glob(os.path.join(save_model_dir, "%s_*.pth" % dlo_type))
+    if not candidates:
+        return None, None
+
+    def step_of(path):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        try:
+            return int(stem.rsplit("_", 1)[1])
+        except (IndexError, ValueError):
+            return -1
+    best = max(candidates, key=step_of)
+    return best, step_of(best)
+
+
+def load_pickle_if_exists(path):
+    if os.path.isfile(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return None
+
+
 class Train_DeformData(Dataset):
-    def __init__(self, DLO_type, train_set_number, time_horizon, device):
+    """Additive perf/memory fix (not upstream, see deform_notes.md "OOM / swap-thrashing"
+    writeup): upstream eagerly materialized EVERY overlapping time_horizon-length sliding
+    window for the whole dataset into self.previous_vertices/vertices/target_vertices/mu_0
+    lists at __init__ time -- O(total_frames * time_horizon) memory (each frame duplicated
+    into up to time_horizon windows, x3 for the previous/current/target offset copies).
+    d003_v054's ~8.07M-frame/78-episode dataset OOM'd this machine (13GB+ RSS, swap-
+    thrashing to the point of needing a hard kill) even though d003_v053's smaller 62-episode
+    set had stayed just under the ceiling. Fixed by storing each episode's base (T,3,N) array
+    ONCE (O(total_frames) memory total) and slicing out each of the three offset windows
+    lazily in __getitem__ instead -- previous/vertices/target_vertices are just 0/+1/+2-frame-
+    shifted views of the identical underlying sequence, so there's nothing to precompute."""
+
+    def __init__(self, DLO_type, train_set_number, time_horizon, device, log_fn=_default_log):
         super(Train_DeformData, self).__init__()
         '''
         change the root dir based in your dir
@@ -28,38 +149,69 @@ class Train_DeformData(Dataset):
         self.root_dir = "data_set/%s/train/" %DLO_type
         inputs_file_list = glob.glob(self.root_dir + "*")
         self.device = device
-        self.inputs = []
-        bar = tqdm(random.choices(inputs_file_list, k=train_set_number))
-        length = time_horizon
-        self.previous_vertices = []
-        self.vertices = []
-        self.target_vertices = []
-        self.end_vertices = []
-        self.mu_0 = []
-        for rope_data in bar:
-            rope_verts = pd.read_pickle(r'%s' % str(rope_data))
-            mu_0_list = torch.zeros(len(rope_verts) - 1 - 1, 3).to(self.device)
-            for i in range(len(rope_verts) - 1 - 1):
+        chosen_files = random.choices(inputs_file_list, k=train_set_number)
+        length = self.length = time_horizon
+        self.episodes = []      # per-episode (T,3,N) numpy array, z-clipped once
+        self.episode_mu0 = []   # per-episode (T-2,3) tensor on self.device
+        window_counts = []      # windows contributed by each episode, for index mapping
+
+        # Additive perf fix (not upstream): the mu_0 (bishop-frame) recurrence below is
+        # inherently sequential across frames -- each depends on the previous one -- so it
+        # can't be vectorized across time. But upstream ran every single-frame step through
+        # .to(device) (a real GPU transfer + kernel launch for a batch-of-1 op), ~300k times
+        # for this project's episode counts/lengths. That's pure latency with zero compute
+        # benefit from the GPU, and produces no output until the whole precompute finishes --
+        # a multi-hour run stuck here is indistinguishable from hung. Fix: do the recurrence
+        # on CPU (compute_u0/parallelTransportFrame are device-agnostic -- see util.py, they
+        # read io_u.device dynamically), transfer only the small per-episode mu_0 result once.
+        # See deform_notes.md "slow/looks-frozen training" writeup.
+        episodes_raw = [pd.read_pickle(r'%s' % str(p)) for p in chosen_files]
+        total_frames = sum(len(rv) - 1 - 1 for rv in episodes_raw)
+        frames_done = 0
+        precompute_start = time.time()
+        log_fn(c("[data]", BCYN) + " precomputing mu_0 (bishop frames) for %d train episodes, "
+               "%d frames total, on CPU" % (train_set_number, total_frames))
+
+        for ep_idx, rope_verts in enumerate(episodes_raw):
+            rope_arr = np.array(rope_verts)
+            n_frames = len(rope_arr) - 1 - 1
+            mu_0_list = torch.zeros(n_frames, 3)
+            init_direction = torch.tensor(((0., 0.6, 0.8), (0., .0, 1.))).unsqueeze(dim=0)
+            for i in range(n_frames):
                 if i == 0:
-                    init_direction = torch.tensor(((0., 0.6, 0.8), (0., .0, 1.))).to(self.device).unsqueeze(dim=0)
-                    vertices = torch.transpose(torch.tensor(np.array(rope_verts[i + 1: i + 1 + 1])).to(self.device),1, 2).float()
+                    vertices = torch.transpose(torch.tensor(rope_arr[i + 1: i + 1 + 1]), 1, 2).float()
                     rest_edges = computeEdges(vertices)
                     m_u0 = compute_u0(rest_edges.float()[:, 0], init_direction.repeat(1, 1, 1)[:, 0])
                     mu_0_list[i] = m_u0
 
                 else:
-                    previous_vertices = torch.transpose(torch.tensor(np.array(rope_verts[i: i + 1])).to(self.device),1, 2).float()
-                    current_vertices = torch.transpose(torch.tensor(np.array(rope_verts[i + 1: i + 1 + 1])).to(self.device),1, 2).float()
+                    previous_vertices = torch.transpose(torch.tensor(rope_arr[i: i + 1]), 1, 2).float()
+                    current_vertices = torch.transpose(torch.tensor(rope_arr[i + 1: i + 1 + 1]), 1, 2).float()
                     previous_edge = computeEdges(previous_vertices)
                     current_edges = computeEdges(current_vertices)
                     m_u0 = parallelTransportFrame(previous_edge[:, 0], current_edges[:, 0], m_u0.clone())
                     mu_0_list[i] = m_u0
+
+                frames_done += 1
+                if frames_done % 2000 == 0 or frames_done == total_frames:
+                    pct = 100.0 * frames_done / max(total_frames, 1)
+                    elapsed = time.time() - precompute_start
+                    rate = frames_done / elapsed if elapsed > 0 else 0.0
+                    eta = (total_frames - frames_done) / rate if rate > 0 else float("nan")
+                    log_fn(c("[data]", BCYN) + " %s frames %s ep %d/%d  %s frames/s  ETA %s"
+                           % (pbar(pct), c("%d/%d" % (frames_done, total_frames), BOLD),
+                              ep_idx + 1, train_set_number, c("%.0f" % rate, CYN),
+                              c("%.0fs" % eta, YLW)))
+
+            mu_0_list = mu_0_list.to(self.device)
 
             for i in range(len(rope_verts) - 1 - length):
                 self.previous_vertices.append(rope_verts[i:i + length])
                 self.vertices.append(rope_verts[i + 1: i + 1 + length])
                 self.target_vertices.append(rope_verts[i + 2:i + 2 + length])
                 self.mu_0.append(mu_0_list[i:i + length])
+
+        log_fn(c("[data]", BCYN) + " mu_0 precompute done in " + c("%.1fs" % (time.time() - precompute_start), BGRN))
 
         self.previous_vertices = np.array(self.previous_vertices)
         self.previous_vertices[:, :, -1] = np.clip(self.previous_vertices[:, :, -1], a_min=2e-3 + 1e-6, a_max=10000.)
@@ -80,12 +232,14 @@ class Train_DeformData(Dataset):
         return previous_vertices.clone().detach(), vertices.clone().detach(), target_vertices.clone().detach(), self.mu_0[index].clone().detach()
 
 class Eval_DeformData(Dataset):
-    def __init__(self, DLO_type, eval_set_number, time_horizon, device):
+    def __init__(self, DLO_type, eval_set_number, time_horizon, device, log_fn=_default_log):
         super(Eval_DeformData, self).__init__()
         self.root_dir = "data_set/%s/eval/" %DLO_type
         inputs_file_list = glob.glob(self.root_dir + "*")
         self.device = device
-        bar = tqdm(random.choices(inputs_file_list, k=eval_set_number))
+        chosen_files = random.choices(inputs_file_list, k=eval_set_number)
+        log_fn(c("[data]", BCYN) + " loading %d eval episodes" % eval_set_number)
+        bar = tqdm(chosen_files)
         length = time_horizon
 
         self.previous_vertices = []
@@ -120,12 +274,21 @@ def save_pickle(data, myfile):
     with open(myfile, "wb") as f:
         pickle.dump(data, f)
 
-def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_time_horizon, batch, DEFORM_func, DEFORM_sim, device, max_update_steps=None):
+def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_time_horizon, batch, DEFORM_func, DEFORM_sim, device, max_update_steps=None, on_existing_checkpoint="ask"):
+    log, log_path = make_logger(DLO_type)
+    log(c("=== starting DEFORM training: DLO_type=%s train_time_horizon=%d eval_time_horizon=%d "
+        "max_update_steps=%s ===" % (DLO_type, train_time_horizon, eval_time_horizon, max_update_steps), BOLD, BCYN))
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        gpu_idx = int(str(device).split(":")[1]) if ":" in str(device) else torch.cuda.current_device()
+        log(c("GPU:", BGRN) + " %s (%s)" % (torch.cuda.get_device_name(gpu_idx), device))
+    else:
+        log(c("WARNING: running on CPU", BRED, BOLD) + " -- this will be far slower than GPU")
+    log(c("logging to %s" % log_path, DIM))
     '''
     Dataset Loading
     '''
-    train_dataset = Train_DeformData(DLO_type, train_set_number, train_time_horizon, device)
-    eval_dataset = Eval_DeformData(DLO_type, eval_set_number, eval_time_horizon, device)
+    train_dataset = Train_DeformData(DLO_type, train_set_number, train_time_horizon, device, log_fn=log)
+    eval_dataset = Eval_DeformData(DLO_type, eval_set_number, eval_time_horizon, device, log_fn=log)
     eval_data_len = len(eval_dataset)
     train_data_loader = DataLoader(train_dataset, batch_size=batch, shuffle=True, drop_last=True)
     '''
@@ -357,6 +520,50 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
     clamped_selection = torch.tensor((0, 1, -2, -1))
     clamped_index[clamped_selection] = torch.tensor((1.))
 
+    # Resume/restart (additive, not upstream -- upstream always trained from a fresh random
+    # init on every invocation, silently overwriting save_model/<tag>_<step>.pth and
+    # loss_record/*_<tag>.pkl at matching step numbers on any restart, with no way to
+    # continue a stopped run). See deform_notes.md.
+    resume_step = 0
+    resumed_losses = resumed_epochs = resumed_eval_losses = resumed_eval_epochs = None
+    existing_ckpt, existing_step = find_latest_checkpoint(DLO_type)
+    if existing_ckpt is not None:
+        log(c("[resume]", BYLW) + " found existing checkpoint %s (step=%d)"
+            % (existing_ckpt, existing_step))
+        decision = on_existing_checkpoint
+        if decision == "ask":
+            try:
+                while True:
+                    ans = input(c("  Resume training from step %d, or start over? "
+                                   "[r]esume / [s]tart over: " % existing_step, BOLD)).strip().lower()
+                    if ans in ("r", "resume"):
+                        decision = "resume"
+                        break
+                    if ans in ("s", "start", "fresh", "start over"):
+                        decision = "fresh"
+                        break
+                    print(c("  please answer 'r' (resume) or 's' (start over)", DIM))
+            except EOFError:
+                decision = "fresh"
+                log(c("[resume]", BRED) + " no interactive stdin available -- defaulting to "
+                    "start-over (pass --on_existing_checkpoint=resume to resume non-interactively)")
+        if decision == "resume":
+            DEFORM_sim.load_state_dict(torch.load(existing_ckpt, map_location=device))
+            resume_step = existing_step
+            resumed_losses = load_pickle_if_exists("loss_record/train_loss_%s.pkl" % DLO_type)
+            resumed_epochs = load_pickle_if_exists("loss_record/train_epoch_%s.pkl" % DLO_type)
+            resumed_eval_losses = load_pickle_if_exists("loss_record/eval_loss_%s.pkl" % DLO_type)
+            resumed_eval_epochs = load_pickle_if_exists("loss_record/eval_epoch_%s.pkl" % DLO_type)
+            log(c("[resume]", BGRN) + " resuming from step %d (loss history %s)"
+                % (resume_step, "restored" if resumed_losses is not None else "not found, starting empty"))
+        else:
+            log(c("[resume]", YLW) + " starting fresh -- ignoring existing checkpoint (this will "
+                "overwrite save_model/loss_record files at matching step numbers as training proceeds)")
+    if max_update_steps is not None and resume_step >= max_update_steps:
+        log(c("[train] checkpoint is already at/past max_update_steps=%d -- nothing to do"
+            % max_update_steps, BOLD, BGRN))
+        return
+
     """learning setup"""
     loss_func = torch.nn.L1Loss()
     network_lr = 1e-4
@@ -389,12 +596,24 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
     evaluate_period = 20
     save_period = 20
     update_steps = 0
+    train_start = time.time()
+
+    def progress_suffix(steps):
+        """Colored progress-bar + ETA tag appended to per-step log lines -- only meaningful
+        when max_update_steps is set (an unbounded run has no known total)."""
+        if not max_update_steps:
+            return ""
+        pct = 100.0 * steps / max_update_steps
+        elapsed = time.time() - train_start
+        rate = steps / elapsed if elapsed > 0 else 0.0
+        eta = (max_update_steps - steps) / rate if rate > 0 else float("nan")
+        return "  %s  ETA %s" % (pbar(pct), c("%.0fs" % eta, YLW))
 
     for epoch in range(train_epoch):
         bar = tqdm(train_data_loader)
         for data in bar:
             if save_steps % evaluate_period == 0:
-                print("evaluating")
+                log(c("[eval]", BYLW) + " starting eval @ step=%d%s" % (update_steps, progress_suffix(update_steps)))
                 eval_batch = eval_set_number
                 part_eval = eval_set_number
                 eval_set, test_set = torch.utils.data.random_split(eval_dataset, [part_eval, eval_data_len - part_eval])
@@ -488,8 +707,8 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
 
                             eval_time += 1
                 eval_losses.append(eval_loss.cpu().detach().numpy() / (eval_time_horizon * part_eval // eval_batch))
-                print("[eval] step=%d eval_loss=%.6f  (history: %s)"
-                      % (update_steps, eval_losses[-1], eval_losses), flush=True)
+                log(c("[eval]", BYLW) + " step=%d eval_loss=%s  (history: %s)"
+                    % (update_steps, c("%.6f" % eval_losses[-1], BOLD), eval_losses))
                 eval_epochs.append(update_steps)
                 """save loss into local files. to do: tensor board"""
                 save_pickle(eval_losses, "loss_record/eval_loss_%s.pkl" % (DLO_type))
@@ -519,13 +738,14 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
 
                 losses.append(traj_loss.cpu().detach().numpy() / train_time_horizon)
                 epochs.append(update_steps)
-                print("[train] step=%d epoch=%d loss=%.6f" % (update_steps, epoch, losses[-1]), flush=True)
+                log(c("[train]", BGRN) + " step=%d epoch=%d loss=%s%s" % (update_steps, epoch, c("%.6f" % losses[-1], BOLD), progress_suffix(update_steps)))
                 if save_steps % save_period == 0:
                     save_pickle(losses, "loss_record/train_loss_%s.pkl" %DLO_type)
                     save_pickle(epochs, "loss_record/train_epoch_%s.pkl" %DLO_type)
                 if max_update_steps is not None and update_steps >= max_update_steps:
                     torch.save(DEFORM_sim.state_dict(), os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))))
-                    print("[train] reached max_update_steps=%d, stopping" % max_update_steps, flush=True)
+                    log(c("[train] reached max_update_steps=%d, stopping (total wall time %.0fs)"
+                        % (max_update_steps, time.time() - train_start), BOLD, BGRN))
                     return
 
             if train_time_horizon > 1:
@@ -559,13 +779,14 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                     update_steps += 1
                     losses.append(traj_loss.cpu().detach().numpy() / train_time_horizon)
                     epochs.append(update_steps)
-                    print("[train] step=%d epoch=%d loss=%.6f" % (update_steps, epoch, losses[-1]), flush=True)
+                    log(c("[train]", BGRN) + " step=%d epoch=%d loss=%s%s" % (update_steps, epoch, c("%.6f" % losses[-1], BOLD), progress_suffix(update_steps)))
                     if save_steps % save_period == 0:
                         save_pickle(losses, "loss_record/train_loss_%s.pkl" % DLO_type)
                         save_pickle(epochs, "loss_record/train_epoch_%s.pkl" % DLO_type)
                     if max_update_steps is not None and update_steps >= max_update_steps:
                         torch.save(DEFORM_sim.state_dict(), os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))))
-                        print("[train] reached max_update_steps=%d, stopping" % max_update_steps, flush=True)
+                        log(c("[train] reached max_update_steps=%d, stopping (total wall time %.0fs)"
+                        % (max_update_steps, time.time() - train_start), BOLD, BGRN))
                         return
 
                 else:
@@ -615,13 +836,14 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                     update_steps += 1
                     losses.append(traj_loss_record.cpu().detach().numpy() / train_time_horizon)
                     epochs.append(update_steps)
-                    print("[train] step=%d epoch=%d loss=%.6f" % (update_steps, epoch, losses[-1]), flush=True)
+                    log(c("[train]", BGRN) + " step=%d epoch=%d loss=%s%s" % (update_steps, epoch, c("%.6f" % losses[-1], BOLD), progress_suffix(update_steps)))
                     if save_steps % save_period == 0:
                         save_pickle(losses, "loss_record/train_loss_%s.pkl" % DLO_type)
                         save_pickle(epochs, "loss_record/train_epoch_%s.pkl" % DLO_type)
                     if max_update_steps is not None and update_steps >= max_update_steps:
                         torch.save(DEFORM_sim.state_dict(), os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))))
-                        print("[train] reached max_update_steps=%d, stopping" % max_update_steps, flush=True)
+                        log(c("[train] reached max_update_steps=%d, stopping (total wall time %.0fs)"
+                        % (max_update_steps, time.time() - train_start), BOLD, BGRN))
                         return
 
 if __name__ == "__main__":
@@ -652,6 +874,11 @@ if __name__ == "__main__":
     parser.add_argument("--max_update_steps", type=int, default=None,
                          help="stop after this many training steps (checkpoints/eval "
                               "already happen every 20 steps regardless) [unbounded]")
+    parser.add_argument("--on_existing_checkpoint", type=str, default="ask",
+                         choices=["ask", "resume", "fresh"],
+                         help="what to do when save_model/<DLO_type>_*.pth already exists: "
+                              "ask interactively, resume from it, or start fresh (overwriting "
+                              "matching step numbers) [ask]")
     args = parser.parse_args()
     # NOTE: upstream previously ignored args.train_set_number/eval_set_number/
     # train_time_horizon/eval_time_horizon here, hardcoding 56/14/100/500 regardless of
@@ -659,5 +886,6 @@ if __name__ == "__main__":
     train(DLO_type=args.DLO_type, train_set_number=args.train_set_number,
           eval_set_number=args.eval_set_number, train_time_horizon=args.train_time_horizon,
           eval_time_horizon=args.eval_time_horizon, batch=32, DEFORM_func=DEFORM_func,
-          DEFORM_sim=DEFORM_sim, device=args.device, max_update_steps=args.max_update_steps)
+          DEFORM_sim=DEFORM_sim, device=args.device, max_update_steps=args.max_update_steps,
+          on_existing_checkpoint=args.on_existing_checkpoint)
 
