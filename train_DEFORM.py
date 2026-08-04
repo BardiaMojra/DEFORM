@@ -87,15 +87,39 @@ def make_logger(dlo_type):
     os.makedirs("logs", exist_ok=True)
     log_path = os.path.join("logs", "train_%s.log" % dlo_type)
     log_file = open(log_path, "a", buffering=1)
+    cursor = {"open": False}   # True while an in-place line is sitting unterminated on the tty
 
-    def log(msg, color=None):
+    def log(msg, color=None, in_place=False):
         # msg may already contain inline c(...) color tags (e.g. a colored "[data]" prefix
         # mixed with plain text) -- strip ANSI codes for the file line regardless, so the
         # log file is always plain/grep-able no matter how the caller built the string.
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         term_msg = c(msg, color) if color else msg
         plain_line = "[%s] %s" % (ts, _ANSI_RE.sub("", msg))
-        print("%s %s" % (c("[%s]" % ts, DIM), term_msg), flush=True)
+        full_term_line = "%s %s" % (c("[%s]" % ts, DIM), term_msg)
+
+        if in_place and _TTY:
+            # \r + \x1b[K (erase to end of line) makes each tick overwrite the previous one
+            # in place instead of scrolling, and the erase -- not just relying on the new
+            # text being >= as long as the old -- means leftover characters don't linger if
+            # the terminal was narrowed since the last tick. Re-measure cols on every call
+            # (not cached) so a live resize is picked up immediately.
+            visible = _ANSI_RE.sub("", full_term_line)
+            cols = term_cols()
+            if len(visible) > cols - 1:
+                full_term_line = visible[:cols - 1]   # plain fallback once colored won't fit
+            sys.stdout.write("\r\x1b[K" + full_term_line)
+            sys.stdout.flush()
+            cursor["open"] = True
+        else:
+            if cursor["open"]:
+                sys.stdout.write("\n")   # close out the in-place line before a normal one
+                cursor["open"] = False
+            print(full_term_line, flush=True)
+
+        # the log file always gets a full discrete line per call, in_place or not -- so
+        # `tail -f logs/train_<DLO_type>.log` still shows every tick even though the tty
+        # only ever shows the latest one
         log_file.write(plain_line + "\n")
     return log, log_path
 
@@ -134,8 +158,8 @@ class Train_DeformData(Dataset):
     window for the whole dataset into self.previous_vertices/vertices/target_vertices/mu_0
     lists at __init__ time -- O(total_frames * time_horizon) memory (each frame duplicated
     into up to time_horizon windows, x3 for the previous/current/target offset copies).
-    d003_v054's ~8.07M-frame/78-episode dataset OOM'd this machine (13GB+ RSS, swap-
-    thrashing to the point of needing a hard kill) even though d003_v053's smaller 62-episode
+    d003_v050's ~8.07M-frame/78-episode dataset OOM'd this machine (13GB+ RSS, swap-
+    thrashing to the point of needing a hard kill) even though d003_v070's smaller 62-episode
     set had stayed just under the ceiling. Fixed by storing each episode's base (T,3,N) array
     ONCE (O(total_frames) memory total) and slicing out each of the three offset windows
     lazily in __getitem__ instead -- previous/vertices/target_vertices are just 0/+1/+2-frame-
@@ -201,35 +225,41 @@ class Train_DeformData(Dataset):
                     log_fn(c("[data]", BCYN) + " %s frames %s ep %d/%d  %s frames/s  ETA %s"
                            % (pbar(pct), c("%d/%d" % (frames_done, total_frames), BOLD),
                               ep_idx + 1, train_set_number, c("%.0f" % rate, CYN),
-                              c("%.0fs" % eta, YLW)))
+                              c("%.0fs" % eta, YLW)),
+                           in_place=(frames_done != total_frames))
 
-            mu_0_list = mu_0_list.to(self.device)
-
-            for i in range(len(rope_verts) - 1 - length):
-                self.previous_vertices.append(rope_verts[i:i + length])
-                self.vertices.append(rope_verts[i + 1: i + 1 + length])
-                self.target_vertices.append(rope_verts[i + 2:i + 2 + length])
-                self.mu_0.append(mu_0_list[i:i + length])
+            # z-clip once on the full base array -- equivalent to clipping each of the three
+            # offset windows separately (upstream's approach): clipping is elementwise, and
+            # previous/vertices/target are just 0/+1/+2-shifted slices of this same array, so
+            # every element gets the identical clip either way.
+            rope_arr[:, -1] = np.clip(rope_arr[:, -1], a_min=2e-3 + 1e-6, a_max=10000.)
+            self.episodes.append(rope_arr)
+            self.episode_mu0.append(mu_0_list)
+            window_counts.append(max(0, len(rope_verts) - 1 - length))
 
         log_fn(c("[data]", BCYN) + " mu_0 precompute done in " + c("%.1fs" % (time.time() - precompute_start), BGRN))
 
-        self.previous_vertices = np.array(self.previous_vertices)
-        self.previous_vertices[:, :, -1] = np.clip(self.previous_vertices[:, :, -1], a_min=2e-3 + 1e-6, a_max=10000.)
-
-        self.vertices = np.array(self.vertices)
-        self.vertices[:, :, -1] = np.clip(self.vertices[:, :, -1], a_min=2e-3 + 1e-6, a_max=10000.)
-
-        self.target_vertices = np.array(self.target_vertices)
-        self.target_vertices[:, :, -1] = np.clip(self.target_vertices[:, :, -1], a_min=2e-3 + 1e-6, a_max=10000.)
+        self._cum_windows = np.concatenate(([0], np.cumsum(window_counts)))
 
     def __len__(self):
-        return len(self.vertices)
+        return int(self._cum_windows[-1])
 
     def __getitem__(self, index):
-        previous_vertices = torch.transpose(torch.tensor(np.array(self.previous_vertices[index])).to(self.device), 1, 2).float()
-        vertices = torch.transpose(torch.tensor(np.array(self.vertices[index])).to(self.device), 1,2).float()
-        target_vertices = torch.transpose(torch.tensor(np.array(self.target_vertices[index])).to(self.device), 1, 2).float()
-        return previous_vertices.clone().detach(), vertices.clone().detach(), target_vertices.clone().detach(), self.mu_0[index].clone().detach()
+        # searchsorted(..., side="right") - 1 maps a flat window index back to which episode
+        # it falls in (cum_windows[ep] <= index < cum_windows[ep+1]) and the in-episode frame
+        # offset -- see the class docstring for why windows aren't precomputed/stored directly.
+        ep_idx = int(np.searchsorted(self._cum_windows, index, side="right") - 1)
+        i = index - int(self._cum_windows[ep_idx])
+        rope_arr = self.episodes[ep_idx]
+        length = self.length
+        previous_vertices = torch.transpose(
+            torch.tensor(rope_arr[i:i + length]).to(self.device), 1, 2).float()
+        vertices = torch.transpose(
+            torch.tensor(rope_arr[i + 1:i + 1 + length]).to(self.device), 1, 2).float()
+        target_vertices = torch.transpose(
+            torch.tensor(rope_arr[i + 2:i + 2 + length]).to(self.device), 1, 2).float()
+        mu_0 = self.episode_mu0[ep_idx][i:i + length]
+        return previous_vertices.clone().detach(), vertices.clone().detach(), target_vertices.clone().detach(), mu_0.clone().detach()
 
 class Eval_DeformData(Dataset):
     def __init__(self, DLO_type, eval_set_number, time_horizon, device, log_fn=_default_log):
