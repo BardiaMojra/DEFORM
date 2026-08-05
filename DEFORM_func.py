@@ -402,7 +402,13 @@ class DEFORM_func(nn.Module):
         magnitude = (o_kb * o_kb).sum(axis=1)
         sinPhi, cosPhi = extractSinandCos_numpy(magnitude)
         o_kb_norm = np.expand_dims(np.linalg.norm(o_kb, axis=1), axis=1)
-        q = np.concatenate((np.expand_dims(sinPhi, axis=1) * np.where(o_kb_norm !=0, o_kb/o_kb_norm, o_kb), np.expand_dims(cosPhi, axis=1)), axis=1)
+        # o_kb_norm==0 implies o_kb is itself the zero vector there, so the safe-divide
+        # "out" value (0) is identical to the old np.where(..., o_kb) fallback -- this
+        # just avoids numpy actually evaluating o_kb/o_kb_norm at those positions (the old
+        # np.where() form computed BOTH branches unconditionally, which is what raised
+        # "RuntimeWarning: invalid value encountered in divide" on every straight-rod frame).
+        safe_kb_dir = np.divide(o_kb, o_kb_norm, out=np.zeros_like(o_kb), where=o_kb_norm != 0)
+        q = np.concatenate((np.expand_dims(sinPhi, axis=1) * safe_kb_dir, np.expand_dims(cosPhi, axis=1)), axis=1)
         for i in range(1, self.n_edge):
             uv = quaternion_rotation_numpy(o_u, edges, q, i)
             o_u = np.concatenate((o_u, np.where(1 - np.expand_dims(cosPhi[i], axis=0) <= 1e-6, o_u[i - 1], uv[0])), axis=0)
