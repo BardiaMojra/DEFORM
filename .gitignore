@@ -4,10 +4,13 @@
 __pycache__/
 *.pyc
 
-# raw per-episode training/eval data -- kept offline only (large, grows with every
-# new dlo_traj_tag calibrated/trained on this project's own dataset). What DOES get
-# committed: save_model/ (trained weights) and data_set/*/dlo_type_config.json (the
-# small per-tag metadata needed to load a checkpoint) -- "post the final results, not
-# the underlying data" per project convention.
+# raw per-episode training/eval data AND trained checkpoints -- both kept offline
+# only now (policy update: previously save_model/ was the one thing committed as
+# "the final results", but per-episode data grows with every new dlo_traj_tag
+# trained on this project's own dataset, and checkpoints are cheap to regenerate --
+# neither belongs in git). data_set/*/dlo_type_config.json (small per-tag metadata,
+# not per-episode data) is still tracked.
 data_set/*/train/
 data_set/*/eval/
+save_model/
+loss_record/
