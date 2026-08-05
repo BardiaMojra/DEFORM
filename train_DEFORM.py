@@ -1,3 +1,4 @@
+import concurrent.futures
 import glob
 import os
 import argparse
@@ -152,6 +153,44 @@ def load_pickle_if_exists(path):
     return None
 
 
+def _compute_episode_mu0(rope_verts, length):
+    """Runs in a worker process, one call per episode (see Train_DeformData.__init__).
+    The bishop-frame recurrence is sequential frame-to-frame WITHIN an episode (each
+    depends on the previous one via parallelTransportFrame) so it can't be vectorized
+    across time -- but it's fully independent ACROSS episodes (no shared state), so
+    farming episodes out to a process pool parallelizes what used to be a single-core
+    loop. Returns (z-clipped (T,3,N) array, (T-2,3) mu_0 tensor, window_count) for this
+    one episode."""
+    torch.set_num_threads(1)   # avoid oversubscription -- N worker processes each also
+                                # trying to multithread these (tiny, batch-of-1) ops would
+                                # thrash the CPU instead of speeding anything up
+    rope_arr = np.array(rope_verts)
+    n_frames = len(rope_arr) - 1 - 1
+    mu_0_list = torch.zeros(n_frames, 3)
+    init_direction = torch.tensor(((0., 0.6, 0.8), (0., .0, 1.))).unsqueeze(dim=0)
+    for i in range(n_frames):
+        if i == 0:
+            vertices = torch.transpose(torch.tensor(rope_arr[i + 1: i + 1 + 1]), 1, 2).float()
+            rest_edges = computeEdges(vertices)
+            m_u0 = compute_u0(rest_edges.float()[:, 0], init_direction.repeat(1, 1, 1)[:, 0])
+            mu_0_list[i] = m_u0
+        else:
+            previous_vertices = torch.transpose(torch.tensor(rope_arr[i: i + 1]), 1, 2).float()
+            current_vertices = torch.transpose(torch.tensor(rope_arr[i + 1: i + 1 + 1]), 1, 2).float()
+            previous_edge = computeEdges(previous_vertices)
+            current_edges = computeEdges(current_vertices)
+            m_u0 = parallelTransportFrame(previous_edge[:, 0], current_edges[:, 0], m_u0.clone())
+            mu_0_list[i] = m_u0
+
+    # z-clip once on the full base array -- equivalent to clipping each of the three
+    # offset windows separately (upstream's approach): clipping is elementwise, and
+    # previous/vertices/target are just 0/+1/+2-shifted slices of this same array, so
+    # every element gets the identical clip either way.
+    rope_arr[:, -1] = np.clip(rope_arr[:, -1], a_min=2e-3 + 1e-6, a_max=10000.)
+    window_count = max(0, len(rope_arr) - 1 - length)
+    return rope_arr, mu_0_list, window_count
+
+
 class Train_DeformData(Dataset):
     """Additive perf/memory fix (not upstream, see deform_notes.md "OOM / swap-thrashing"
     writeup): upstream eagerly materialized EVERY overlapping time_horizon-length sliding
@@ -179,63 +218,47 @@ class Train_DeformData(Dataset):
         self.episode_mu0 = []   # per-episode (T-2,3) tensor on self.device
         window_counts = []      # windows contributed by each episode, for index mapping
 
-        # Additive perf fix (not upstream): the mu_0 (bishop-frame) recurrence below is
-        # inherently sequential across frames -- each depends on the previous one -- so it
-        # can't be vectorized across time. But upstream ran every single-frame step through
-        # .to(device) (a real GPU transfer + kernel launch for a batch-of-1 op), ~300k times
-        # for this project's episode counts/lengths. That's pure latency with zero compute
-        # benefit from the GPU, and produces no output until the whole precompute finishes --
-        # a multi-hour run stuck here is indistinguishable from hung. Fix: do the recurrence
-        # on CPU (compute_u0/parallelTransportFrame are device-agnostic -- see util.py, they
-        # read io_u.device dynamically), transfer only the small per-episode mu_0 result once.
-        # See deform_notes.md "slow/looks-frozen training" writeup.
+        # Additive perf fix (not upstream): the mu_0 (bishop-frame) recurrence is inherently
+        # sequential WITHIN an episode -- each frame depends on the previous one -- so it
+        # can't be vectorized across time. But it's fully independent ACROSS episodes (no
+        # shared state), so instead of running all of them serially on a single core (see
+        # _compute_episode_mu0's own docstring for why it's a worker-process function),
+        # farm episodes out to a process pool. Also keeps it off the GPU (compute_u0/
+        # parallelTransportFrame are device-agnostic -- see util.py, they read io_u.device
+        # dynamically): upstream ran every single-frame step through .to(device), a real
+        # GPU transfer + kernel launch for a batch-of-1 op, ~300k times for this project's
+        # episode counts/lengths -- pure latency with zero compute benefit from the GPU,
+        # and produced no output until the whole precompute finished, so a multi-hour run
+        # stuck here was indistinguishable from hung. See deform_notes.md "slow/looks-frozen
+        # training" writeup.
         episodes_raw = [pd.read_pickle(r'%s' % str(p)) for p in chosen_files]
         total_frames = sum(len(rv) - 1 - 1 for rv in episodes_raw)
+        n_workers = min(len(episodes_raw), max(1, (os.cpu_count() or 2) - 1))
         frames_done = 0
+        episodes_done = 0
         precompute_start = time.time()
         log_fn(c("[data]", BCYN) + " precomputing mu_0 (bishop frames) for %d train episodes, "
-               "%d frames total, on CPU" % (train_set_number, total_frames))
+               "%d frames total, on CPU x%d workers" % (train_set_number, total_frames, n_workers))
 
-        for ep_idx, rope_verts in enumerate(episodes_raw):
-            rope_arr = np.array(rope_verts)
-            n_frames = len(rope_arr) - 1 - 1
-            mu_0_list = torch.zeros(n_frames, 3)
-            init_direction = torch.tensor(((0., 0.6, 0.8), (0., .0, 1.))).unsqueeze(dim=0)
-            for i in range(n_frames):
-                if i == 0:
-                    vertices = torch.transpose(torch.tensor(rope_arr[i + 1: i + 1 + 1]), 1, 2).float()
-                    rest_edges = computeEdges(vertices)
-                    m_u0 = compute_u0(rest_edges.float()[:, 0], init_direction.repeat(1, 1, 1)[:, 0])
-                    mu_0_list[i] = m_u0
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = [pool.submit(_compute_episode_mu0, rv, length) for rv in episodes_raw]
+            for fut in concurrent.futures.as_completed(futures):
+                rope_arr, mu_0_list, window_count = fut.result()
+                self.episodes.append(rope_arr)
+                self.episode_mu0.append(mu_0_list)
+                window_counts.append(window_count)
 
-                else:
-                    previous_vertices = torch.transpose(torch.tensor(rope_arr[i: i + 1]), 1, 2).float()
-                    current_vertices = torch.transpose(torch.tensor(rope_arr[i + 1: i + 1 + 1]), 1, 2).float()
-                    previous_edge = computeEdges(previous_vertices)
-                    current_edges = computeEdges(current_vertices)
-                    m_u0 = parallelTransportFrame(previous_edge[:, 0], current_edges[:, 0], m_u0.clone())
-                    mu_0_list[i] = m_u0
-
-                frames_done += 1
-                if frames_done % 2000 == 0 or frames_done == total_frames:
-                    pct = 100.0 * frames_done / max(total_frames, 1)
-                    elapsed = time.time() - precompute_start
-                    rate = frames_done / elapsed if elapsed > 0 else 0.0
-                    eta = (total_frames - frames_done) / rate if rate > 0 else float("nan")
-                    log_fn(c("[data]", BCYN) + " %s frames %s ep %d/%d  %s frames/s  ETA %s"
-                           % (pbar(pct), c("%d/%d" % (frames_done, total_frames), BOLD),
-                              ep_idx + 1, train_set_number, c("%.0f" % rate, CYN),
-                              c("%.0fs" % eta, YLW)),
-                           in_place=(frames_done != total_frames))
-
-            # z-clip once on the full base array -- equivalent to clipping each of the three
-            # offset windows separately (upstream's approach): clipping is elementwise, and
-            # previous/vertices/target are just 0/+1/+2-shifted slices of this same array, so
-            # every element gets the identical clip either way.
-            rope_arr[:, -1] = np.clip(rope_arr[:, -1], a_min=2e-3 + 1e-6, a_max=10000.)
-            self.episodes.append(rope_arr)
-            self.episode_mu0.append(mu_0_list)
-            window_counts.append(max(0, len(rope_verts) - 1 - length))
+                episodes_done += 1
+                frames_done += len(mu_0_list)
+                pct = 100.0 * frames_done / max(total_frames, 1)
+                elapsed = time.time() - precompute_start
+                rate = frames_done / elapsed if elapsed > 0 else 0.0
+                eta = (total_frames - frames_done) / rate if rate > 0 else float("nan")
+                log_fn(c("[data]", BCYN) + " %s frames %s eps %s  %s frames/s  ETA %s"
+                       % (pbar(pct), c("%d/%d" % (frames_done, total_frames), BOLD),
+                          c("%d/%d" % (episodes_done, train_set_number), BOLD),
+                          c("%.0f" % rate, CYN), c("%.0fs" % eta, YLW)),
+                       in_place=(episodes_done != train_set_number))
 
         log_fn(c("[data]", BCYN) + " mu_0 precompute done in " + c("%.1fs" % (time.time() - precompute_start), BGRN))
 
@@ -258,7 +281,7 @@ class Train_DeformData(Dataset):
             torch.tensor(rope_arr[i + 1:i + 1 + length]).to(self.device), 1, 2).float()
         target_vertices = torch.transpose(
             torch.tensor(rope_arr[i + 2:i + 2 + length]).to(self.device), 1, 2).float()
-        mu_0 = self.episode_mu0[ep_idx][i:i + length]
+        mu_0 = self.episode_mu0[ep_idx][i:i + length].to(self.device)
         return previous_vertices.clone().detach(), vertices.clone().detach(), target_vertices.clone().detach(), mu_0.clone().detach()
 
 class Eval_DeformData(Dataset):
