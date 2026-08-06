@@ -6,11 +6,11 @@ live_plot_loss.py
 Live view of train_DEFORM.py's own loss_record/*.pkl files (train_loss_<tag>.pkl,
 train_epoch_<tag>.pkl, eval_loss_<tag>.pkl, eval_epoch_<tag>.pkl -- see its save_pickle()
 calls) -- one figure per dlo_traj_tag, re-read and redrawn every --interval seconds while
-training runs, and saved to save_model/<tag>_loss.png on every refresh (DEFORM's own
-method-output dir, alongside that tag's save_model/<tag>_<step>.pth checkpoints -- same
-convention dataset_quartermaster.py's DEFORM_SAVE_MODEL_DIR/der_params/<tag>.json already
-use, one method-owned artifact store per method) -- so there's always an on-disk copy, not
-just the live window.
+training runs, and saved to <tag>/save_model/<tag>_loss.png on every refresh (the
+session's own per-tag models/ tree, alongside that tag's save_model/<tag>_<step>.pth
+checkpoints -- same convention dataset_quartermaster.py's MODELS_DIR/der's own
+models/DER/<tag>/<tag>.json already use, one method-owned artifact store per method) --
+so there's always an on-disk copy, not just the live window.
 
 Usage: ./live_plot_loss.py [--dlo_types d003_v050 d003_v070 ...] [--interval 3] [--log]
   (no --dlo_types: auto-discovers every "d0NN_..." tag with a loss record on disk)
@@ -26,9 +26,7 @@ import time
 import matplotlib
 import matplotlib.pyplot as plt
 
-REPO_DIR = os.path.expanduser("~/git/DEFORM")
-LOSS_DIR = os.path.join(REPO_DIR, "loss_record")
-PLOTS_DIR = os.path.join(REPO_DIR, "save_model")
+MODELS_DIR = os.path.expanduser("~/bags/test_session_001/models")
 
 _TAG_RE = re.compile(r'^d\d{3}(_v\d{3}|_all)$')
 
@@ -38,9 +36,18 @@ TRAIN_COLOR = "#2a78d6"
 EVAL_COLOR = "#eb6834"
 
 
+def loss_dir(tag):
+    return os.path.join(MODELS_DIR, "DEFORM", tag, "loss_record")
+
+
+def plots_dir(tag):
+    return os.path.join(MODELS_DIR, "DEFORM", tag, "save_model")
+
+
 def discover_tags():
     tags = set()
-    for path in glob.glob(os.path.join(LOSS_DIR, "train_loss_*.pkl")):
+    for path in glob.glob(os.path.join(MODELS_DIR, "DEFORM", "*", "loss_record",
+                                        "train_loss_*.pkl")):
         name = os.path.basename(path)[len("train_loss_"):-len(".pkl")]
         if _TAG_RE.match(name):
             tags.add(name)
@@ -58,8 +65,8 @@ def load_pickle_if_exists(path):
 class TagPlot:
     def __init__(self, tag, log_scale):
         self.tag = tag
-        os.makedirs(PLOTS_DIR, exist_ok=True)
-        self.out_path = os.path.join(PLOTS_DIR, "%s_loss.png" % tag)
+        os.makedirs(plots_dir(tag), exist_ok=True)
+        self.out_path = os.path.join(plots_dir(tag), "%s_loss.png" % tag)
         self.fig, self.ax = plt.subplots(figsize=(9, 5))
         self.ax.set_title("%s -- DEFORM training loss" % tag)
         self.ax.set_xlabel("update step")
@@ -75,14 +82,15 @@ class TagPlot:
         self.fig.tight_layout()
 
     def refresh(self):
+        tag_loss_dir = loss_dir(self.tag)
         train_epochs = load_pickle_if_exists(
-            os.path.join(LOSS_DIR, "train_epoch_%s.pkl" % self.tag)) or []
+            os.path.join(tag_loss_dir, "train_epoch_%s.pkl" % self.tag)) or []
         train_losses = load_pickle_if_exists(
-            os.path.join(LOSS_DIR, "train_loss_%s.pkl" % self.tag)) or []
+            os.path.join(tag_loss_dir, "train_loss_%s.pkl" % self.tag)) or []
         eval_epochs = load_pickle_if_exists(
-            os.path.join(LOSS_DIR, "eval_epoch_%s.pkl" % self.tag)) or []
+            os.path.join(tag_loss_dir, "eval_epoch_%s.pkl" % self.tag)) or []
         eval_losses = load_pickle_if_exists(
-            os.path.join(LOSS_DIR, "eval_loss_%s.pkl" % self.tag)) or []
+            os.path.join(tag_loss_dir, "eval_loss_%s.pkl" % self.tag)) or []
 
         n = min(len(train_epochs), len(train_losses))
         self.train_line.set_data(train_epochs[:n], train_losses[:n])
@@ -111,16 +119,15 @@ def main():
     parser.add_argument("--log", action="store_true", help="log-scale y-axis")
     args = parser.parse_args()
 
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-
     tags = args.dlo_types or discover_tags()
     if not tags:
-        print("No loss_record/train_loss_*.pkl found yet under %s -- nothing to watch "
-              "(this fills in once train_DEFORM.py starts logging steps)." % LOSS_DIR)
+        print("No <tag>/loss_record/train_loss_*.pkl found yet under %s/DEFORM -- nothing "
+              "to watch (this fills in once train_DEFORM.py starts logging steps)."
+              % MODELS_DIR)
         return
     print("Watching %d tag(s): %s" % (len(tags), ", ".join(tags)))
-    print("Saving to %s/<tag>_loss.png every %.1fs -- Ctrl+C to stop." %
-          (PLOTS_DIR, args.interval))
+    print("Saving to %s/DEFORM/<tag>/save_model/<tag>_loss.png every %.1fs -- Ctrl+C to stop."
+          % (MODELS_DIR, args.interval))
 
     plt.ion()
     plots = [TagPlot(tag, args.log) for tag in tags]
