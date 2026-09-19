@@ -27,12 +27,23 @@ good state, so the driver can fall back to its own prediction for that frame.
 Runs in DEFORM's own venv (DEFORM_PYTHON / <repo>/.venv), like deform_infer.py.
 """
 
-import argparse
 import os
+
+# Tiny model (n_vert = 10) and "evaluation_numpy" mode converts to numpy every step, so the BLAS
+# and torch thread pools -- 20 threads each on this box -- spend more time synchronizing than
+# computing. Measured 2026-09-19, 600 frames of t004_d003_v070: 12.3 s at the default 20 threads
+# against 4.1 s at 1 (2 threads 4.3 s, 4 threads 5.2 s), with node coordinates bit-identical, so
+# this is speed only. Must run BEFORE numpy/torch are imported, which is why it sits up here.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, os.environ.get("DEFORM_TORCH_THREADS", "1"))
+
+import argparse
 import sys
 
 import numpy as np
 import torch
+
+torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -89,6 +100,7 @@ class Stepper(object):
                     computeEdges(prev)[:, 0], computeEdges(pred)[:, 0], self.m_u0)
                 self.vert = pred
         return self.vert[0].cpu().numpy().reshape(-1)
+
 
 
 def main():

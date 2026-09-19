@@ -45,16 +45,27 @@ dlo_e01_theta..dlo_e{n_edge}_theta (material twist angle per edge), proc_time_s,
 status (PASS/FAIL -- FAIL if any NaN/Inf appears in the predicted state).
 """
 
+import os
+
+# Tiny model (n_vert = 10) and "evaluation_numpy" mode converts to numpy every step, so the BLAS
+# and torch thread pools -- 20 threads each on this box -- spend more time synchronizing than
+# computing. Measured 2026-09-19, 600 frames of t004_d003_v070: 12.3 s at the default 20 threads
+# against 4.1 s at 1 (2 threads 4.3 s, 4 threads 5.2 s), with node coordinates bit-identical, so
+# this is speed only. Must run BEFORE numpy/torch are imported, which is why it sits up here.
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, os.environ.get("DEFORM_TORCH_THREADS", "1"))
+
 import argparse
 import csv
 import json
-import os
 import pickle
 import sys
 import time
 
 import numpy as np
 import torch
+
+torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -227,8 +238,12 @@ def build_arg_parser():
     # A single-episode autoregressive rollout is cheap enough that CPU is fine here
     # regardless -- training (batch=32, theseus in "train" mode) is where the GPU
     # patch actually matters.
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cpu",
+                         help="cpu (default, see the comment above) or cuda -- cuda currently "
+                              "throws a theseus device mismatch in evaluation_numpy mode "
+                              "[%(default)s]")
     return parser
+
 
 
 def main():
