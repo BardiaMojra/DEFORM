@@ -410,7 +410,16 @@ class DEFORM_func(nn.Module):
         safe_kb_dir = np.divide(o_kb, o_kb_norm, out=np.zeros_like(o_kb), where=o_kb_norm != 0)
         q = np.concatenate((np.expand_dims(sinPhi, axis=1) * safe_kb_dir, np.expand_dims(cosPhi, axis=1)), axis=1)
         for i in range(1, self.n_edge):
-            uv = quaternion_rotation_numpy(o_u, edges, q, i)
+            # A straight segment gives kb = 0 and cosPhi = 1, and a diverged state gives NaN;
+            # either way q[i] is a zero or non-finite quaternion that scipy's from_quat refuses.
+            # The straight case is exactly what the np.where() below falls back to, so carry the
+            # previous edge's directors instead of calling into scipy at all
+            # (dlo_data_001 eval 2026-09-16: d004 rollouts died here mid-episode).
+            if (1 - cosPhi[i]) <= 1e-6 or not np.all(np.isfinite(q[i])) \
+                    or np.linalg.norm(q[i]) < 1e-12:
+                uv = (np.expand_dims(o_u[i - 1], axis=0), np.expand_dims(o_v[i - 1], axis=0))
+            else:
+                uv = quaternion_rotation_numpy(o_u, edges, q, i)
             o_u = np.concatenate((o_u, np.where(1 - np.expand_dims(cosPhi[i], axis=0) <= 1e-6, o_u[i - 1], uv[0])), axis=0)
             o_v = np.concatenate((o_v, np.where(1 - np.expand_dims(cosPhi[i], axis=0) <= 1e-6, o_v[i - 1], uv[1])), axis=0)
 
