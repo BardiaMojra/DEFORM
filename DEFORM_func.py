@@ -5,6 +5,36 @@ from util import extractSinandCos, computeEdges, computeKB, quaternion_q, comput
 import theseus as th
 import numpy as np
 
+# ---------------------------------------------------------------------------------------------
+# Ill-conditioned solves: retry, then report instead of poisoning the model with NaN.
+SOLVE_RETRIES = 2                 # one try plus two retries, each with heavier damping
+SOLVE_DAMPING = 1e-3
+SOLVE_DAMPING_GROWTH = 100.0
+SOLVE_FAILURES = 0                # total batches whose solve never converged, this process
+_LAST_SOLVE_FAILURE = None        # message of the most recent one, for the caller's log
+
+
+def _recoverable_solve_error(err):
+    """A linear-algebra failure inside the optimizer, as opposed to a real bug."""
+    msg = str(err)
+    return ("positive-definite" in msg or "linear optimizer" in msg or "cholesky" in msg.lower()
+            or "singular" in msg.lower())
+
+
+def note_solve_failure(msg, attempt):
+    global SOLVE_FAILURES, _LAST_SOLVE_FAILURE
+    if attempt >= SOLVE_RETRIES:                      # only the final give-up counts as a failure
+        SOLVE_FAILURES += 1
+        _LAST_SOLVE_FAILURE = msg
+
+
+def take_solve_failure():
+    """The last unrecovered solve failure, cleared -- None when the step was clean."""
+    global _LAST_SOLVE_FAILURE
+    msg, _LAST_SOLVE_FAILURE = _LAST_SOLVE_FAILURE, None
+    return msg
+
+
 class DEFORM_func(nn.Module):
     def __init__(self, n_vert, n_edge, device):
         super().__init__()
@@ -180,14 +210,33 @@ class DEFORM_func(nn.Module):
 
         non_linear_opt_layer_init = th.TheseusLayer(optimizer)
         non_linear_opt_layer_init.to(self.device)
-        """execute optimization"""
-        solution, info = non_linear_opt_layer_init.forward(
-            input_tensors={"kb": kb.clone(), "b_u": b_u.clone(), "b_v": b_v.clone(), "m_restW1": m_restW1.clone(),
-                           "m_restW2": m_restW2.clone(), "restRegionL": restRegionL.clone(),
-                           "theta": inner_theta.clone(), "controlled_theta": end_theta.clone()},
-        )
+        """execute optimization
 
-        return torch.concatenate((end_theta[:, 0], solution["theta"], end_theta[:, -1]), dim=1)
+        The Cholesky factorization of the normal equations fails ("not positive-definite") when the
+        rope state is nearly degenerate -- two ground-truth nodes almost on top of each other make
+        the curvature terms blow up. Retry with heavier Levenberg-Marquardt damping, which is what
+        an ill-conditioned system needs; if it still fails, keep the current theta, count the
+        failure and let the caller skip this batch (SOLVE_FAILURES / take_solve_failure)."""
+        inputs = {"kb": kb.clone(), "b_u": b_u.clone(), "b_v": b_v.clone(),
+                  "m_restW1": m_restW1.clone(), "m_restW2": m_restW2.clone(),
+                  "restRegionL": restRegionL.clone(), "theta": inner_theta.clone(),
+                  "controlled_theta": end_theta.clone()}
+        theta = None
+        for attempt in range(SOLVE_RETRIES + 1):
+            try:
+                solution, info = non_linear_opt_layer_init.forward(
+                    input_tensors=inputs,
+                    optimizer_kwargs={"damping": SOLVE_DAMPING * (SOLVE_DAMPING_GROWTH ** attempt)},
+                )
+                theta = solution["theta"]
+                break
+            except RuntimeError as e:
+                if not _recoverable_solve_error(e):
+                    raise
+                note_solve_failure(str(e).splitlines()[0][:160], attempt)
+        if theta is None:
+            theta = inner_theta                       # no update: this batch is not usable
+        return torch.concatenate((end_theta[:, 0], theta, end_theta[:, -1]), dim=1)
 
     def Model_Energy(self, kb, b_u, b_v, m_restW1, m_restW2, restRegionL, inner_theta, end_theta):
         """

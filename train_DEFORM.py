@@ -14,6 +14,7 @@ import open3d as o3d
 import os
 import pandas as pd
 from tqdm import tqdm
+import DEFORM_func as DEFORM_func_mod
 from DEFORM_func import DEFORM_func
 from DEFORM_sim import DEFORM_sim
 from util import computeLengths, computeEdges, compute_u0, parallelTransportFrame
@@ -326,6 +327,62 @@ class Eval_DeformData(Dataset):
 def save_pickle(data, myfile):
     with open(myfile, "wb") as f:
         pickle.dump(data, f)
+
+# ---------------------------------------------------------------------------------------------
+# One bad batch used to end the fit: an ill-conditioned solve (nearly coincident ground-truth
+# nodes -- d004 has them) produced non-finite gradients, optimizer.step() wrote NaN into every
+# parameter, and training carried on to save a NaN checkpoint that made every rollout diverge.
+# A batch is now applied only when its numbers are usable; otherwise it is skipped and counted.
+GRAD_CLIP_NORM = 1.0              # DEFORM's stiffness lrs are ~1e-11: one huge gradient is fatal
+STEP_SKIP_LIMIT = 20              # consecutive unusable batches before the fit gives up
+
+
+def _params_of(optimizer):
+    return [p for g in optimizer.param_groups for p in g["params"]]
+
+
+def apply_update(loss, optimizer, retain_graph=True):
+    """Backward + step for one batch. Returns None when the step was applied, else why it was not.
+    Nothing is written to the model unless the loss, the gradients and the parameters are finite."""
+    solve_err = DEFORM_func_mod.take_solve_failure()
+    if solve_err:
+        optimizer.zero_grad()
+        return "solve did not converge after %d retries (%s)" % (DEFORM_func_mod.SOLVE_RETRIES,
+                                                                 solve_err)
+    if loss is None or not torch.isfinite(loss).all():
+        optimizer.zero_grad()
+        return "loss is not finite"
+    try:
+        loss.backward(retain_graph=retain_graph)
+    except RuntimeError as e:
+        optimizer.zero_grad()
+        return "backward failed (%s)" % str(e).splitlines()[0][:120]
+    params = _params_of(optimizer)
+    gnorm = torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP_NORM)
+    if not torch.isfinite(gnorm):
+        optimizer.zero_grad()
+        return "gradients are not finite"
+    optimizer.step()
+    bad = [n for n, p in enumerate(params) if not torch.isfinite(p).all()]
+    if bad:
+        return "parameters went non-finite in the step (%d tensor(s))" % len(bad)
+    return None
+
+
+def state_is_finite(model):
+    return all(not torch.is_tensor(v) or torch.isfinite(v).all() for v in model.state_dict().values())
+
+
+def save_checkpoint(model, path, log=None):
+    """Save only a finite model: a NaN checkpoint is worse than no checkpoint, because the eval
+    side would happily load it and every rollout would diverge in its first frames."""
+    if not state_is_finite(model):
+        if log:
+            log("[train] NOT saving %s: the model holds non-finite values" % os.path.basename(path))
+        return False
+    torch.save(model.state_dict(), path)
+    return True
+
 
 def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_time_horizon, batch, DEFORM_func, DEFORM_sim, device, max_update_steps=None, on_existing_checkpoint="ask"):
     log, log_path = make_logger(DLO_type)
@@ -649,6 +706,8 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
     evaluate_period = 20
     save_period = 20
     update_steps = 0
+    skipped_steps = 0          # consecutive batches whose numbers were unusable
+    skipped_total = 0
     train_start = time.time()
 
     def progress_suffix(steps):
@@ -671,7 +730,7 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                 part_eval = eval_set_number
                 eval_set, test_set = torch.utils.data.random_split(eval_dataset, [part_eval, eval_data_len - part_eval])
                 eval_data_loader = DataLoader(eval_set, batch_size=eval_batch, shuffle=True, drop_last=True)
-                torch.save(DEFORM_sim.state_dict(),os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))))
+                save_checkpoint(DEFORM_sim, os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))), log)
                 eval_loss = 0
                 eval_bar = tqdm(eval_data_loader)
                 """evaluation: for faster evaluation, use DEFORM_sim(..., mode = "evaluation_numpy")"""
@@ -783,8 +842,19 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                 pred_vertice, pred_v, theta_full = DEFORM_sim(vertices[:, traj_num], current_v, init_direction.repeat(batch, 1, 1), clamped_index, m_u0[:, traj_num], inputs[:, traj_num], clamped_selection, theta_full)
                 traj_loss = loss_func(pred_vertice, target_vertices[:, traj_num])
                 v_loss = loss_func(pred_v, target_v)
-                (traj_loss + v_loss).backward(retain_graph=True)
-                optimizer.step()
+                loss = traj_loss + v_loss
+                skip_reason = apply_update(loss, optimizer)
+                if skip_reason:
+                    skipped_steps += 1
+                    skipped_total += 1
+                    log(c("[train]", BYLW) + " step=%d batch skipped (%s) [%d in a row, %d total]"
+                        % (update_steps, skip_reason, skipped_steps, skipped_total))
+                    if skipped_steps >= STEP_SKIP_LIMIT:
+                        raise RuntimeError("training aborted: %d batches in a row were unusable (%s) -- "
+                                           "the last finite checkpoint stays as the fit"
+                                           % (skipped_steps, skip_reason))
+                    continue
+                skipped_steps = 0
 
                 save_steps += 1
                 update_steps += 1
@@ -796,7 +866,7 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                     save_pickle(losses, "loss_record/train_loss_%s.pkl" %DLO_type)
                     save_pickle(epochs, "loss_record/train_epoch_%s.pkl" %DLO_type)
                 if max_update_steps is not None and update_steps >= max_update_steps:
-                    torch.save(DEFORM_sim.state_dict(), os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))))
+                    save_checkpoint(DEFORM_sim, os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))), log)
                     log(c("[train] reached max_update_steps=%d, stopping (total wall time %.0fs)"
                         % (max_update_steps, time.time() - train_start), BOLD, BGRN))
                     return
@@ -826,8 +896,18 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                             traj_loss = loss_func(pred_vertice, target_vertices[:, traj_num])
                             v_loss = loss_func(current_v, target_v)
                             loss += traj_loss + v_loss
-                    loss.backward(retain_graph=True)
-                    optimizer.step()
+                    skip_reason = apply_update(loss, optimizer)
+                    if skip_reason:
+                        skipped_steps += 1
+                        skipped_total += 1
+                        log(c("[train]", BYLW) + " step=%d batch skipped (%s) [%d in a row, %d total]"
+                            % (update_steps, skip_reason, skipped_steps, skipped_total))
+                        if skipped_steps >= STEP_SKIP_LIMIT:
+                            raise RuntimeError("training aborted: %d batches in a row were unusable (%s) -- "
+                                               "the last finite checkpoint stays as the fit"
+                                               % (skipped_steps, skip_reason))
+                        continue
+                    skipped_steps = 0
                     save_steps += 1
                     update_steps += 1
                     losses.append(traj_loss.cpu().detach().numpy() / train_time_horizon)
@@ -837,7 +917,7 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                         save_pickle(losses, "loss_record/train_loss_%s.pkl" % DLO_type)
                         save_pickle(epochs, "loss_record/train_epoch_%s.pkl" % DLO_type)
                     if max_update_steps is not None and update_steps >= max_update_steps:
-                        torch.save(DEFORM_sim.state_dict(), os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))))
+                        save_checkpoint(DEFORM_sim, os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))), log)
                         log(c("[train] reached max_update_steps=%d, stopping (total wall time %.0fs)"
                         % (max_update_steps, time.time() - train_start), BOLD, BGRN))
                         return
@@ -883,8 +963,18 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                             traj_loss_record += traj_loss
                             loss += traj_loss + v_loss
 
-                    loss.backward(retain_graph=True)
-                    optimizer.step()
+                    skip_reason = apply_update(loss, optimizer)
+                    if skip_reason:
+                        skipped_steps += 1
+                        skipped_total += 1
+                        log(c("[train]", BYLW) + " step=%d batch skipped (%s) [%d in a row, %d total]"
+                            % (update_steps, skip_reason, skipped_steps, skipped_total))
+                        if skipped_steps >= STEP_SKIP_LIMIT:
+                            raise RuntimeError("training aborted: %d batches in a row were unusable (%s) -- "
+                                               "the last finite checkpoint stays as the fit"
+                                               % (skipped_steps, skip_reason))
+                        continue
+                    skipped_steps = 0
                     save_steps += 1
                     update_steps += 1
                     losses.append(traj_loss_record.cpu().detach().numpy() / train_time_horizon)
@@ -894,7 +984,7 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
                         save_pickle(losses, "loss_record/train_loss_%s.pkl" % DLO_type)
                         save_pickle(epochs, "loss_record/train_epoch_%s.pkl" % DLO_type)
                     if max_update_steps is not None and update_steps >= max_update_steps:
-                        torch.save(DEFORM_sim.state_dict(), os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))))
+                        save_checkpoint(DEFORM_sim, os.path.join("save_model/", "%s_%s.pth" % (DLO_type, str(update_steps))), log)
                         log(c("[train] reached max_update_steps=%d, stopping (total wall time %.0fs)"
                         % (max_update_steps, time.time() - train_start), BOLD, BGRN))
                         return
