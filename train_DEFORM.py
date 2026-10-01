@@ -381,6 +381,13 @@ def save_checkpoint(model, path, log=None):
             log("[train] NOT saving %s: the model holds non-finite values" % os.path.basename(path))
         return False
     torch.save(model.state_dict(), path)
+    # marker for the eval side: it runs in a container WITHOUT torch (dlo_melodic) and cannot
+    # open the checkpoint to check it, so the writer states it here instead
+    # (deform_adapter.checkpoint_is_finite).
+    try:
+        open(path + ".finite", "w").close()
+    except OSError:
+        pass
     return True
 
 
