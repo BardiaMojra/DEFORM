@@ -391,10 +391,11 @@ def save_checkpoint(model, path, log=None):
     return True
 
 
-def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_time_horizon, batch, DEFORM_func, DEFORM_sim, device, max_update_steps=None, on_existing_checkpoint="ask"):
+def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_time_horizon, batch, DEFORM_func, DEFORM_sim, device, max_update_steps=None, on_existing_checkpoint="ask", lr_mult=1.0):
     log, log_path = make_logger(DLO_type)
     log(c("=== starting DEFORM training: DLO_type=%s train_time_horizon=%d eval_time_horizon=%d "
-        "max_update_steps=%s ===" % (DLO_type, train_time_horizon, eval_time_horizon, max_update_steps), BOLD, BCYN))
+        "max_update_steps=%s lr_mult=%g ===" % (DLO_type, train_time_horizon, eval_time_horizon,
+                                               max_update_steps, lr_mult), BOLD, BCYN))
     if str(device).startswith("cuda") and torch.cuda.is_available():
         gpu_idx = int(str(device).split(":")[1]) if ":" in str(device) else torch.cuda.current_device()
         log(c("GPU:", BGRN) + " %s (%s)" % (torch.cuda.get_device_name(gpu_idx), device))
@@ -684,7 +685,9 @@ def train(DLO_type, train_set_number, eval_set_number, train_time_horizon, eval_
     """learning setup"""
     loss_func = torch.nn.L1Loss()
     network_lr = 1e-4
-    lr_scale = 0.1
+    # additive: lr_mult scales every group's lr (1.0 = upstream). At upstream rates 200 steps moved
+    # the validation loss 0.5% (d001_v050, 2026-10-28); x4000 reached -68% by step 160, stable
+    lr_scale = 0.1 * float(lr_mult)
     parameters_to_update = [
         {"params": DEFORM_sim.integration_ratio, "lr": 1e-5 * lr_scale},
         {"params": DEFORM_sim.velocity_ratio, "lr": 1e-5 * lr_scale},
@@ -1024,6 +1027,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_update_steps", type=int, default=None,
                          help="stop after this many training steps (checkpoints/eval "
                               "already happen every 20 steps regardless) [unbounded]")
+    parser.add_argument("--lr_mult", type=float, default=1.0,
+                         help="multiplier on every learning rate (1.0 = upstream) [1.0]")
     parser.add_argument("--on_existing_checkpoint", type=str, default="ask",
                          choices=["ask", "resume", "fresh"],
                          help="what to do when save_model/<DLO_type>_*.pth already exists: "
@@ -1037,5 +1042,5 @@ if __name__ == "__main__":
           eval_set_number=args.eval_set_number, train_time_horizon=args.train_time_horizon,
           eval_time_horizon=args.eval_time_horizon, batch=32, DEFORM_func=DEFORM_func,
           DEFORM_sim=DEFORM_sim, device=args.device, max_update_steps=args.max_update_steps,
-          on_existing_checkpoint=args.on_existing_checkpoint)
+          on_existing_checkpoint=args.on_existing_checkpoint, lr_mult=args.lr_mult)
 
