@@ -210,10 +210,10 @@ def write_output_csv(rows, n_vert, n_edge, out_path):
         writer = csv.writer(f)
         writer.writerow(header)
         for r in rows:
-            row = [r["frame_no"], r["status"], "%.6g" % r["proc_time_s"]]
-            row += ["%.6g" % v for v in r["pos"].ravel().tolist()]
-            row += ["%.6g" % v for v in r["vel"].ravel().tolist()]
-            row += ["%.6g" % v for v in r["theta"].ravel().tolist()]
+            row = [r["frame_no"], r["status"], repr(float(r["proc_time_s"]))]
+            row += [repr(v) for v in r["pos"].ravel().tolist()]
+            row += [repr(v) for v in r["vel"].ravel().tolist()]
+            row += [repr(v) for v in r["theta"].ravel().tolist()]
             writer.writerow(row)
 
 
